@@ -49,6 +49,7 @@ import time
 import datetime
 import urllib2
 import ssl
+import httplib
 
 #################################################################################
 #Some definitions To use
@@ -67,6 +68,13 @@ SystemPressureURL=DomoticzHost+"json.htm?type=command&param=udevice&idx=75&nvalu
 RoomSetpointURL=DomoticzHost+"json.htm?type=command&param=udevice&idx=76&nvalue=0&svalue="
 IonizationCurrentURL=DomoticzHost+"json.htm?type=command&param=udevice&idx=79&nvalue=0&svalue="
 DeltaTURL=DomoticzHost+"json.htm?type=command&param=udevice&idx=83&nvalue=0&svalue="
+StatusURL=DomoticzHost+"json.htm?type=command&param=udevice&idx=84&nvalue=0&svalue="
+RuntimeHeatingURL=DomoticzHost+"json.htm?type=command&param=udevice&idx=85&nvalue=0&svalue="
+RuntimeHotWaterURL=DomoticzHost+"json.htm?type=command&param=udevice&idx=86&nvalue=0&svalue="
+BurnerStartsURL=DomoticzHost+"json.htm?type=command&param=udevice&idx=87&nvalue=0&svalue="
+HotWaterFlowURL=DomoticzHost+"json.htm?type=command&param=udevice&idx=89&nvalue=0&svalue="
+SystemEfficiencyURL=DomoticzHost+"json.htm?type=command&param=udevice&idx=90&nvalue=0&svalue="
+SystemStatusURL=DomoticzHost+"json.htm?type=command&param=udevice&idx=91&nvalue=0&svalue="
 
 #Creating a context to indicate to urllib2 that I don't want SSL verification
 #because my domoticz setup does not have a valid CERT certificate.
@@ -86,6 +94,107 @@ StatusDictionary = {
    '0L' : 'Adjusting Gas intake',
    '0U' : 'Starting up the unit',
 }
+
+
+# This dictionary translate the return temperature into a heater efficiency %
+# by taking into account the both heating efficiency as well as water vapor condensation
+# that occurs within HR heaters as function of return water temperature.
+# Note, the numbers are linear estimation/interpolation based on several distinct numbers between
+# 10C - 60C.
+EfficiencyDictionary = {
+   10 : '111',
+   11 : '110.8',
+   12 : '110.6',
+   13 : '110.4',
+   14 : '110.2',
+   15 : '110',
+   16 : '109.8',
+   17 : '109.6',
+   18 : '109.4',
+   19 : '109.2',
+   20 : '109',
+   21 : '108.7',
+   22 : '108.4',
+   23 : '108.1',
+   24 : '107.8',
+   25 : '107.5',
+   26 : '107.2',
+   27 : '106.9',
+   28 : '106.6',
+   29 : '106.3',
+   30 : '106',
+   31 : '105.5',
+   32 : '105',
+   33 : '104.5',
+   34 : '104',
+   35 : '103.5',
+   36 : '103',
+   37 : '102.5',
+   38 : '102',
+   39 : '101.5',
+   40 : '101',
+   41 : '100.2',
+   42 : '99.4',
+   43 : '98.6',
+   44 : '97.8',
+   45 : '97',
+   46 : '96.2',
+   47 : '95.4',
+   48 : '94.6',
+   49 : '93.8',
+   50 : '93',
+   51 : '89.7',
+   52 : '89.4',
+   53 : '89.1',
+   54 : '88.8',
+   55 : '88.5',
+   56 : '88.2',
+   57 : '87.9',
+   58 : '87.6',
+   59 : '87.3',
+   60 : '87',
+   61 : '86.7',
+   62 : '86.4',
+   63 : '86.1',
+   64 : '85.8',
+   65 : '85.5',
+   66 : '85.2',
+   67 : '84.9',
+   68 : '84.6',
+   69 : '84.3',
+   70 : '84',
+   71 : '83.7',
+   72 : '83.4',
+   73 : '83.1',
+   74 : '82.8',
+   75 : '82.5',
+   76 : '82.2',
+   77 : '81.9',
+   78 : '81.6',
+   79 : '81.3',
+   80 : '81',
+   81 : '80.7',
+   82 : '80.4',
+   83 : '80.1',
+   84 : '79.8',
+   85 : '79.5',
+   86 : '79.2',
+   87 : '78.9',
+   88 : '78.6',
+   89 : '78.3',
+   90 : '78',
+   91 : '77.7',
+   92 : '77.4',
+   93 : '77.1',
+   94 : '76.8',
+   95 : '76.5',
+   96 : '76.2',
+   97 : '75.9',
+   98 : '75.6',
+   99 : '75.3',
+   100 : '75',
+}
+
 
 
 #################################################################################
@@ -131,6 +240,8 @@ def CRCOK(SerialBuffer):
    CRC = CalculateNefitEMSCRC(SerialBuffer)
    BufferLength = len(SerialBuffer)
    OK = (CRC==int(SerialBuffer[(BufferLength-1)],16))
+   if not OK:
+      print('CRC not OK, Expected='+SerialBuffer[(BufferLength-1)]+', Calculated='+CRC.__str__()+', Message='+SerialBuffer.__str__())
    return (OK)
 
 #################################################################################
@@ -164,8 +275,13 @@ def NextMessage(MyEMS):
 	    # Now check for message with valid CRC meaning we have a complete message
 	    # if we don't have that, we throw it away and continue receiving the next
 	    # message after this break.
-	    if len(Message) > 4 and CRCOK(Message):
-	       MessageReceived = True
+	    if len(Message) > 4: 
+	       #First PostProcess the messsage to remove redundant 0xff before calculating CRC.
+               Message = PostProcessMessage(Message)
+	       if CRCOK(Message):
+	          MessageReceived = True
+	       else:
+	          Message = []  
 	    else:
 	       Message = []  
 	 else:
@@ -192,6 +308,29 @@ def NextMessageOfInterest(MyEMS):
 	 #print('Unknown Message ID='+Message[2]+', Message='+Message.__str__())
    return (Message)
 
+#################################################################################
+# Post Process Message Data, remove double 0xff 0xff in case the message contained 
+# an actual 0xff byte. (Because our PARMRK termios setting as side effect will
+# replace each 0xff in the bytestream with 0xff 0xff to be able to distinguish
+# between a parity frame error and a message containing a 0xff 0x0 0x0 sequence.) 
+#################################################################################   
+def PostProcessMessage(Message):
+   if '0xff' in Message:
+      ByteRemoved = False
+      NewMessage = []
+      for byte in Message:
+	 if byte == '0xff': 
+	    if not ByteRemoved:
+	       ByteRemoved = True
+	    else:
+	       ByteRemoved = False
+	       NewMessage.append(byte)
+	 else:
+            NewMessage.append(byte)
+   else:
+      NewMessage = Message
+   return(NewMessage)
+      
 #################################################################################
 # Message Data Conversion Functions, input is list of numpy.uint8
 #################################################################################   
@@ -228,18 +367,41 @@ def UpdateDomoticz(URL, Value):
    try:
       Page=urllib2.urlopen(URL+Value.__str__(), context=UnverifiedContext)
       DataString=Page.read()
-   except (urllib2.HTTPError, urllib2.URLError) as fout:
+   except (urllib2.HTTPError, urllib2.URLError, httplib.BadStatusLine) as fout:
       print("Error: "+str(fout)+" URL: "+URL)
+
+def UpdateDomoticzText(URL, Text):
+   TextValue=urllib2.quote(Text)
+   try:
+      Page=urllib2.urlopen(URL+TextValue, context=UnverifiedContext)
+      DataString=Page.read()
+   except (urllib2.HTTPError, urllib2.URLError, httplib.BadStatusLine) as fout:
+      print("Error: "+str(fout)+" URL: "+URL)
+
+#################################################################################
+# Calculate System efficiency by interpolation i.c.w. lookup dictionary
+#################################################################################
+def CalculateSystemEfficiency(Temperature):
+   LowValue=float(EfficiencyDictionary[(int(Temperature))])
+   HighValue=float(EfficiencyDictionary[(int(Temperature)+1)])
+   Fraction=Temperature-(int(Temperature))
+   #Efficiency goes down as temperature goes up, the high and low refer to the
+   #temperature, not the efficiency. Fraction*(HighValue-LowValue) is a negative number.
+   Efficiency=LowValue+(Fraction*(HighValue-LowValue))
+   return(Efficiency)
 
 #################################################################################
 # Our Message Parse Functions
 #################################################################################
 def UBAMonitorFast(Msg):
    Result = dict()
-   #First do sanity check on MsgID, if ok parse the message.
-   if (Msg[2] == '0x18'):
+   #First do sanity check on MsgID and size, if ok parse the message.
+   MsgSize=len(Msg)
+   if (Msg[2] == '0x18') and MsgSize == 30:
+      Result['RequestedFlowTemperature']=ConvertToFloat([Msg[4]],1.0)
       Result['FlowTemperature']=ConvertToFloat([Msg[5],Msg[6]],0.1)
-      Result['BurnerDutyCycle']=ConvertToFloat([Msg[8]],0.01)
+      Result['RequestedBurnerDutyCycle']=ConvertToFloat([Msg[7]],1.0)
+      Result['BurnerDutyCycle']=ConvertToFloat([Msg[8]],1.0)
       Result['Boiler']=ConvertToFloat([Msg[15],Msg[16]],0.1)
       Result['FlowReturnTemperature']=ConvertToFloat([Msg[17],Msg[18]],0.1)
       Result['IonizationCurrent']=ConvertToFloat([Msg[19],Msg[20]],0.1)
@@ -249,35 +411,48 @@ def UBAMonitorFast(Msg):
       Result['DeltaT']=Result['FlowTemperature']-Result['FlowReturnTemperature']
       if StatusDictionary.has_key(Result['StatusCode']):
          Result['StatusText']=StatusDictionary[Result['StatusCode']]
+         UpdateDomoticzText(StatusURL, Result['StatusText'])
+	 if Result['StatusCode'] == '-H':
+	    Result['SystemStatus'] = 1
+	 elif Result['StatusCode'] == '=H':
+	    Result['SystemStatus'] = 2
+	 else:
+	    Result['SystemStatus'] = 0
+	 UpdateDomoticz(SystemStatusURL, Result['SystemStatus'])
       #Result['WarmWaterOut']=(float((256*int(Msg[13],16))+int(Msg[14],16))/10)
-      
-      #Update Domoticz:
       UpdateDomoticz(DeltaTURL, Result['DeltaT']) 
       UpdateDomoticz(FlowTemperatureURL, Result['FlowTemperature']) 
       UpdateDomoticz(ReturnFlowTemperatureURL, Result['FlowReturnTemperature']) 
       UpdateDomoticz(BurnerDutyCycleURL, Result['BurnerDutyCycle']) 
       UpdateDomoticz(SystemPressureURL, Result['Pressure']) 
-      UpdateDomoticz(IonizationCurrentURL, Result['IonizationCurrent']) 
+      UpdateDomoticz(IonizationCurrentURL, Result['IonizationCurrent'])
+      Result['Efficiency']=CalculateSystemEfficiency(float(Result['FlowReturnTemperature']))
+      UpdateDomoticz(SystemEfficiencyURL, Result['Efficiency'])
    return(Result)
 
 def UBAMonitorSlow(Msg):
    Result = dict()
-   #First do sanity check on MsgID, if ok parse the message.
-   if (Msg[2] == '0x19'):
+   #First do sanity check on MsgID and size, if ok parse the message.
+   MsgSize=len(Msg)
+   if (Msg[2] == '0x19') and MsgSize == 32:
       Result['BurnerOutWaterTemperature']=ConvertToFloat([Msg[6],Msg[7]],0.1)
-      Result['PumpDutyCycle']=ConvertToFloat([Msg[13]],0.01)
+      Result['PumpDutyCycle']=ConvertToFloat([Msg[13]],1.0)
       Result['BurnerStarts']=ConvertToint([Msg[14],Msg[15],Msg[16]])
       Result['BurnerRuntimeInMinutes']=ConvertToint([Msg[17],Msg[18],Msg[19]])
       Result['HeatingRuntimeInMinutes']=ConvertToint([Msg[23],Msg[24],Msg[25]])
       Result['HotWaterRuntimeInMinutes']=Result['BurnerRuntimeInMinutes']-Result['HeatingRuntimeInMinutes']
       UpdateDomoticz(BurnerTemperatureURL, Result['BurnerOutWaterTemperature'])
       UpdateDomoticz(PumpDutyCycleURL, Result['PumpDutyCycle'])
+      UpdateDomoticz(RuntimeHeatingURL, (float(Result['HeatingRuntimeInMinutes'])/60))
+      UpdateDomoticz(RuntimeHotWaterURL, (float(Result['HotWaterRuntimeInMinutes'])/60))
+      UpdateDomoticz(BurnerStartsURL, Result['BurnerStarts'])
    return(Result)
 
 def Moduline300Status(Msg):
    Result = dict()
-   #First do sanity check on MsgID, if ok parse the message.
-   if (Msg[2] == '0x91'):
+   #First do sanity check on MsgID and size, if ok parse the message.
+   MsgSize=len(Msg)
+   if (Msg[2] == '0x91') and MsgSize == 19:
       Result['Setpoint']=ConvertToFloat([Msg[5]],0.5)
       Result['Actual']=ConvertToFloat([Msg[15],Msg[16]],0.1)
       UpdateDomoticz(RoomTemperatureURL, Result['Actual'])
@@ -286,11 +461,13 @@ def Moduline300Status(Msg):
 
 def UBAMonitorWWMessage(Msg):
    Result = dict()
-   #First do sanity check on MsgID, if ok parse the message.
-   if (Msg[2] == '0x34'):
+   #First do sanity check on MsgID and size, if ok parse the message.
+   MsgSize=len(Msg)
+   if (Msg[2] == '0x34') and MsgSize == 22:
       Result['BoilerTemperature']=ConvertToFloat([Msg[7],Msg[8]],0.1)
       Result['WarmWaterOutTemperature']=ConvertToFloat([Msg[5],Msg[6]],0.1)
       Result['WarmWaterFlow']=ConvertToFloat([Msg[13]],0.1)
+      UpdateDomoticz(HotWaterFlowURL, Result['WarmWaterFlow'])
    return(Result)
 
 # Dumping Raw Message, usefull for inpecting unknown message types
@@ -313,6 +490,27 @@ MessageParseDispatcher = {
 
 
 #################################################################################
+# Messages seen on the bus, nothing done with yet, for future reference.
+#################################################################################
+# RCTimeMessage:
+#Unknown Message ID=0x6, Message=['0x17', '0x0', '0x6', '0x0', '0x13', '0x2', '0xd', '0x9', '0x31', '0x17', '0x5', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0xb7']
+# ?:
+#Unknown Message ID=0x7, Message=['0x8', '0x0', '0x7', '0x0', '0x3', '0x80', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x6b']
+# UBASollwerte:
+#Unknown Message ID=0x1a, Message=['0x17', '0x8', '0x1a', '0x0', '0x0', '0x0', '0x0', '0x0', '0x3a']
+# UBA WartungsMeldung:
+#Unknown Message ID=0x1c, Message=['0x8', '0x0', '0x1c', '0x0', '0x80', '0x1', '0x1', '0x1', '0x11', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0xed']
+# Flags ?:
+#Unknown Message ID=0x35, Message=['0x17', '0x8', '0x35', '0x0', '0x11', '0x0', '0xc1']
+# ?:
+#Unknown Message ID=0xa2, Message=['0x17', '0x0', '0xa2', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x0', '0x51']
+# RC Temp Message?
+#Unknown Message ID=0xa3, Message=['0x17', '0x0', '0xa3', '0x0', '0x0', '0x0', '0x0', '0x77']
+
+
+
+
+#################################################################################
 # Main Program
 #################################################################################
 
@@ -322,8 +520,10 @@ MyEMS=StartEMS()
 MyEMS.flushInput()
 while (1):
    Result = NextMessageOfInterest(MyEMS)
+   #MessageLength=len(Result)
    ProcessedResult = MessageParseDispatcher[Result[2]](Result)
    Now = datetime.datetime.now().strftime("%H:%M:%S")
+   #print(Now+', Size='+MessageLength.__str__()+', MsgType='+[Result[2]].__str__()+', Data='+ProcessedResult.__str__())
    print(Now+', Data='+ProcessedResult.__str__())
    time.sleep(1)
 
